@@ -18,6 +18,7 @@ class PeriodeEdom extends Model
         'prodi_id'        => 'integer',
         'tanggal_mulai'   => 'date:Y-m-d',
         'tanggal_selesai' => 'date:Y-m-d',
+        'diaktifkan_pada' => 'datetime',
     ];
 
     public function prodi(): BelongsTo

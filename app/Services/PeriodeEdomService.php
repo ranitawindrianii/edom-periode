@@ -2,28 +2,26 @@
 
 namespace App\Services;
 
-// Unit #1 — Manajemen periode EDOM (CRUD).
+// Unit #1 — Membuat & mengelola periode EDOM (CRUD).
 //
 // Format : setiap operasi me-return SATU data periode EDOM (model PeriodeEdom).
 //
-// Constraint yang diterapkan:
+// Constraint Unit #1:
 //  1. fakultas_id & prodi_id wajib; null / string kosong / spasi ditolak;
 //     prodi harus ada dan harus milik fakultas yang dipilih.
 //  2. tahun_akademik disimpan "YYYY/YYYY" (2026, 26/27, 2026/2027 -> 2026/2027);
 //     semester hanya "Ganjil"/"Genap" (ganjil, gasal, 1 -> Ganjil; genap, 2 -> Genap);
 //     tanggal_mulai & tanggal_selesai wajib, input dd-mm-yyyy, disimpan Y-m-d;
 //     status periode baru selalu "DRAF", diisi sistem (input status diabaikan).
-//  3. prodi + tahun_akademik + semester unik; dicek SETELAH normalisasi,
-//     di dalam transaksi; duplikat -> 422. Unique index dipasang lewat Schema::table.
+//  3. prodi + tahun_akademik + semester unik; dicek SETELAH normalisasi, di dalam
+//     transaksi; duplikat -> 422. Unique index dipasang lewat Schema::table.
 //  4. tanggal UAS diambil dari model jadwal UAS yang SUDAH ADA; tolak jika
-//     tanggal_selesai >= tanggal_mulai UAS pada tahun akademik & semester yang sama;
-//     tolak jika tanggal_mulai > tanggal_selesai; tanggal format tidak valid ditolak.
+//     tanggal_selesai >= tanggal_mulai UAS pada tahun akademik & semester yang sama.
 //
-// Tidak ada model/tabel baru. Sesuaikan nama model/kolom di bawah bila di proyek berbeda:
-//  - App\Models\PeriodeEdom : fakultas_id, prodi_id, tahun_akademik, semester,
-//                             tanggal_mulai, tanggal_selesai, status
-//  - App\Models\Prodi       : id, fakultas_id
-//  - App\Models\JadwalUas   : tahun_akademik, semester, tanggal_mulai
+// Validasi tanggal (format dd-mm-yyyy, urutan, bentrok antar-periode) memakai
+// PeriodeEdomTanggalValidator dari Unit #2, sehingga aturannya hanya ada di satu tempat.
+//
+// Tidak ada model/tabel baru. Model yang dipakai: PeriodeEdom, Prodi, JadwalUas.
 
 use App\Models\JadwalUas;
 use App\Models\PeriodeEdom;
@@ -35,7 +33,7 @@ use Illuminate\Validation\ValidationException;
 
 class PeriodeEdomService
 {
-    public const STATUS_DRAF = 'DRAF';
+    public const STATUS_DRAF = PeriodeEdomStatusService::STATUS_DRAF;
 
     private const FIELD_INPUT = [
         'fakultas_id', 'prodi_id', 'tahun_akademik', 'semester', 'tanggal_mulai', 'tanggal_selesai',
@@ -56,10 +54,11 @@ class PeriodeEdomService
 
         return $this->simpanAman($data, function () use ($data) {
             $this->cekDuplikat($data);
+            PeriodeEdomTanggalValidator::validasiBentrok($data['prodi_id'], $data['tanggal_mulai'], $data['tanggal_selesai']);
 
             $periode = new PeriodeEdom();
             $this->isi($periode, $data);
-            $periode->status = self::STATUS_DRAF; // constraint 2: diisi sistem, bukan dari input
+            $periode->status = self::STATUS_DRAF; // diisi sistem, bukan dari input
             $periode->save();
 
             return $periode->refresh();
@@ -83,14 +82,17 @@ class PeriodeEdomService
             'prodi_id'        => $periode->prodi_id,
             'tahun_akademik'  => $periode->tahun_akademik,
             'semester'        => $periode->semester,
-            'tanggal_mulai'   => self::keInputTanggal($periode->tanggal_mulai),
-            'tanggal_selesai' => self::keInputTanggal($periode->tanggal_selesai),
+            'tanggal_mulai'   => $periode->tanggal_mulai?->format('d-m-Y'),
+            'tanggal_selesai' => $periode->tanggal_selesai?->format('d-m-Y'),
         ], array_intersect_key($input, array_flip(self::FIELD_INPUT)));
 
         $data = $this->validasi($gabungan);
 
         return $this->simpanAman($data, function () use ($periode, $data) {
             $this->cekDuplikat($data, $periode->getKey());
+            PeriodeEdomTanggalValidator::validasiBentrok(
+                $data['prodi_id'], $data['tanggal_mulai'], $data['tanggal_selesai'], $periode->getKey()
+            );
 
             $this->isi($periode, $data); // status tidak diubah dari input
             $periode->save();
@@ -113,21 +115,19 @@ class PeriodeEdomService
     /** @return array{fakultas_id:int, prodi_id:int, tahun_akademik:string, semester:string, tanggal_mulai:CarbonImmutable, tanggal_selesai:CarbonImmutable} */
     private function validasi(array $input): array
     {
-        // Constraint 1
         $fakultasId = self::wajibId($input['fakultas_id'] ?? null, 'fakultas_id', 'Fakultas');
         $prodiId    = self::wajibId($input['prodi_id'] ?? null, 'prodi_id', 'Program studi');
         $this->validasiProdiMilikFakultas($prodiId, $fakultasId);
 
-        // Constraint 2
-        $tahunAkademik  = self::normalisasiTahunAkademik($input['tahun_akademik'] ?? null);
-        $semester       = self::normalisasiSemester($input['semester'] ?? null);
-        $tanggalMulai   = self::parseTanggal($input['tanggal_mulai'] ?? null, 'tanggal_mulai', 'Tanggal mulai');
-        $tanggalSelesai = self::parseTanggal($input['tanggal_selesai'] ?? null, 'tanggal_selesai', 'Tanggal selesai');
+        $tahunAkademik = self::normalisasiTahunAkademik($input['tahun_akademik'] ?? null);
+        $semester      = self::normalisasiSemester($input['semester'] ?? null);
 
-        // Constraint 4 — urutan tanggal
-        self::validasiUrutanTanggal($tanggalMulai, $tanggalSelesai);
+        // Format dd-mm-yyyy + urutan (mulai = selesai diterima) — Unit #2
+        [$tanggalMulai, $tanggalSelesai] = PeriodeEdomTanggalValidator::validasiUrutan(
+            $input['tanggal_mulai'] ?? null,
+            $input['tanggal_selesai'] ?? null,
+        );
 
-        // Constraint 4 — harus selesai sebelum UAS dimulai
         $this->validasiSebelumUas($tahunAkademik, $semester, $tanggalSelesai);
 
         return [
@@ -220,33 +220,6 @@ class PeriodeEdomService
         return self::PETA_SEMESTER[$kunci];
     }
 
-    /** Input wajib dd-mm-yyyy dan tanggalnya harus benar-benar ada (31-02-2026 ditolak). */
-    public static function parseTanggal(mixed $nilai, string $field, string $label): CarbonImmutable
-    {
-        $teks = trim((string) ($nilai ?? ''));
-
-        if ($teks === '') {
-            throw ValidationException::withMessages([$field => "{$label} wajib diisi."]);
-        }
-
-        if (preg_match('/^(\d{2})-(\d{2})-(\d{4})$/', $teks, $m) && checkdate((int) $m[2], (int) $m[1], (int) $m[3])) {
-            return CarbonImmutable::createFromFormat('!d-m-Y', $teks);
-        }
-
-        throw ValidationException::withMessages([
-            $field => "{$label} tidak valid. Gunakan format dd-mm-yyyy, contoh: 01-12-2026.",
-        ]);
-    }
-
-    public static function validasiUrutanTanggal(CarbonImmutable $mulai, CarbonImmutable $selesai): void
-    {
-        if ($mulai->greaterThan($selesai)) {
-            throw ValidationException::withMessages([
-                'tanggal_mulai' => 'Tanggal mulai tidak boleh lebih besar dari tanggal selesai.',
-            ]);
-        }
-    }
-
     private function validasiSebelumUas(string $tahunAkademik, string $semester, CarbonImmutable $tanggalSelesai): void
     {
         $mulaiUas = JadwalUas::query()
@@ -259,7 +232,9 @@ class PeriodeEdomService
             return;
         }
 
-        self::validasiTerhadapUas($tanggalSelesai, CarbonImmutable::parse($mulaiUas)->startOfDay());
+        $tanggalUas = CarbonImmutable::createFromFormat('!Y-m-d', substr((string) $mulaiUas, 0, 10));
+
+        self::validasiTerhadapUas($tanggalSelesai, $tanggalUas);
     }
 
     public static function validasiTerhadapUas(CarbonImmutable $tanggalSelesai, CarbonImmutable $mulaiUas): void
@@ -278,7 +253,7 @@ class PeriodeEdomService
             ->where('prodi_id', $data['prodi_id'])
             ->where('tahun_akademik', $data['tahun_akademik'])
             ->where('semester', $data['semester'])
-            ->when($kecualiId, fn ($q) => $q->whereKeyNot($kecualiId))
+            ->when($kecualiId !== null, fn ($q) => $q->whereKeyNot($kecualiId))
             ->lockForUpdate()
             ->exists();
 
@@ -320,10 +295,5 @@ class PeriodeEdomService
     private static function keEmpatDigit(string $tahun): int
     {
         return strlen($tahun) === 2 ? 2000 + (int) $tahun : (int) $tahun;
-    }
-
-    private static function keInputTanggal(mixed $nilai): ?string
-    {
-        return $nilai ? CarbonImmutable::parse($nilai)->format('d-m-Y') : null;
     }
 }
